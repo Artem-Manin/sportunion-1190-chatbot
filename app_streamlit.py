@@ -37,16 +37,13 @@ def get_secret(key: str, default=None):
     - Try Streamlit secrets first (on Streamlit Cloud).
     - If secrets are not configured or key is missing, fall back to env/.env.
     """
-    # Try Streamlit secrets (but handle "no secrets" case gracefully)
     try:
-        # This will raise StreamlitSecretNotFoundError if secrets.toml not set up
         value = st.secrets[key]
         if value is not None:
             return value
     except Exception:
-        pass  # no secrets configured or key not found
+        pass
 
-    # Fallback: environment / .env
     value = os.getenv(key, default)
     return value if value is not None else default
 
@@ -81,23 +78,55 @@ if OPENAI_API_KEY is None:
 
 
 # ================================
-# Load / Build Tables (cached)
+# Cached loader for combined tables
 # ================================
 @st.cache_data(show_spinner=True)
-def load_combined_tables():
-    """Call build_tables.main() → returns player_stats_all & matches_all."""
+def load_combined_tables(download_2526: bool):
+    """
+    Call build_tables.main() → returns player_stats_all & matches_all.
+
+    - download_2526=False: use local 25/26 JSON only (no HTTP).
+    - download_2526=True: download 25/26 from API, save JSON, fallback to local on error.
+    """
     if build_tables is None:
         return pd.DataFrame(), pd.DataFrame()
 
-    res = build_tables.main()
+    res = build_tables.main(download_2526=download_2526)
     p = res.get("player_stats_all", pd.DataFrame())
     m = res.get("matches_all", pd.DataFrame())
-
     return p, m
 
 
+# ================================
+# Data status + Refresh button
+# ================================
+st.markdown("---")
+st.subheader("Data status")
+
+col_refresh, col_info = st.columns([1, 3])
+
+with col_refresh:
+    refresh_clicked = st.button("🔄 Refresh 25/26 data (download from API)")
+
+with col_info:
+    st.caption(
+        "Season 24/25 is always loaded from a local JSON file. "
+        "Season 25/26 normally uses the local JSON too, but you can "
+        "refresh it from the API with this button (e.g. after Monday's match)."
+    )
+
+# If user clicked refresh, clear cache and call loader with download_2526=True
+download_2526_now = bool(refresh_clicked)
+
+if refresh_clicked:
+    # Clear cached results so the new download is used immediately
+    try:
+        load_combined_tables.clear()
+    except Exception:
+        pass
+
 with st.spinner("Preparing data from both seasons..."):
-    player_stats_all, matches_all = load_combined_tables()
+    player_stats_all, matches_all = load_combined_tables(download_2526=download_2526_now)
 
 if player_stats_all.empty or matches_all.empty:
     st.error("❌ Could not load tables from build_tables.py.")
@@ -106,6 +135,16 @@ else:
         f"Loaded player_stats_all ({len(player_stats_all)} rows) and "
         f"matches_all ({len(matches_all)} rows)."
     )
+
+    # Small field: show date of the last game
+    last_game_text = "unknown"
+    if "item_event_date" in matches_all.columns and not matches_all.empty:
+        dates = pd.to_datetime(matches_all["item_event_date"], errors="coerce", utc=True).dropna()
+        if not dates.empty:
+            last_ts = dates.max()
+            last_game_text = last_ts.strftime("%d.%m.%Y")
+
+    st.caption(f"📅 Last game in data: **{last_game_text}**")
 
 
 # ================================
@@ -118,38 +157,53 @@ col1, col2 = st.columns(2)
 with col1:
     exclude_flag = st.checkbox(
         "Exclude players who are marked as exclude_from_statistics",
-        value=True
+        value=True,
     )
 
 with col2:
-    seasons_available = sorted(player_stats_all["season"].dropna().unique())
+    seasons_available = (
+        sorted(player_stats_all["season"].dropna().unique())
+        if not player_stats_all.empty
+        else []
+    )
     seasons_selected = st.multiselect(
         "Seasons to include:",
         options=seasons_available,
-        default=seasons_available
+        default=seasons_available,
     )
 
-if not seasons_selected:
+if not seasons_selected and seasons_available:
     seasons_selected = seasons_available
 
+if not player_stats_all.empty:
+    player_stats = player_stats_all[player_stats_all["season"].isin(seasons_selected)].copy()
+else:
+    player_stats = pd.DataFrame()
 
-# Apply filters
-player_stats = player_stats_all[player_stats_all["season"].isin(seasons_selected)].copy()
-matches = matches_all[matches_all["season"].isin(seasons_selected)].copy()
+if not matches_all.empty:
+    matches = matches_all[matches_all["season"].isin(seasons_selected)].copy()
+else:
+    matches = pd.DataFrame()
 
-if exclude_flag:
+if (
+    exclude_flag
+    and not player_stats.empty
+    and "exclude_from_statistics" in player_stats.columns
+):
     player_stats = player_stats[player_stats["exclude_from_statistics"] == False]
 
+
 # ================================
-# Ask Question (Before Tables)
+# Ask Question (Before Tables) — form so Enter submits
 # ================================
 st.markdown("---")
 st.subheader("Ask a question")
 
-question = st.text_input(
-    "Example: 'Who is the top scorer?', 'How many matches ended 4:3?', 'Show all players with >5 goals'"
-)
-btn = st.button("Ask the LLM")
+with st.form("question_form"):
+    question = st.text_input(
+        "Example: 'Who is the top scorer?', 'How many matches ended 4:3?', 'Show all players with >5 goals'"
+    )
+    submitted = st.form_submit_button("Ask the LLM")
 
 
 # ================================
@@ -181,7 +235,7 @@ def extract_assistant_text(resp):
     """Handles all possible formats of OpenAI responses."""
     try:
         choice = resp.choices[0]
-    except:
+    except Exception:
         return str(resp)
 
     msg = getattr(choice, "message", None)
@@ -197,7 +251,7 @@ def extract_assistant_text(resp):
 
     try:
         return choice["message"]["content"]
-    except:
+    except Exception:
         return str(resp)
 
 
@@ -227,7 +281,7 @@ Examples:
 def build_json_payload(ps: pd.DataFrame, ms: pd.DataFrame):
     payload = {
         "player_stats": ps.to_dict(orient="records"),
-        "matches": ms.to_dict(orient="records")
+        "matches": ms.to_dict(orient="records"),
     }
     text = json.dumps(payload, ensure_ascii=False)
 
@@ -247,8 +301,8 @@ def call_llm(question, ps, ms):
 
     user_content = (
         "DATA_START\n"
-        + tables_json +
-        "\nDATA_END\n\n"
+        + tables_json
+        + "\nDATA_END\n\n"
         f"User question: {question}"
     )
 
@@ -258,17 +312,17 @@ def call_llm(question, ps, ms):
         max_tokens=1200,
         messages=[
             {"role": "system", "content": SYSTEM_INSTRUCTIONS + EXAMPLES},
-            {"role": "user", "content": user_content}
-        ]
+            {"role": "user", "content": user_content},
+        ],
     )
 
     return extract_assistant_text(resp), truncated, resp
 
 
 # ================================
-# Run LLM when button pressed
+# Run LLM when form submitted
 # ================================
-if btn:
+if submitted:
     if not question.strip():
         st.warning("Please enter a question.")
     else:
@@ -285,8 +339,10 @@ if btn:
                 st.write(answer)
 
                 with st.expander("LLM Debug Info"):
-                    st.json({
-                        "input_truncated": truncated,
-                        "model": MODEL,
-                        "first_500_chars": answer[:500]
-                    })
+                    st.json(
+                        {
+                            "input_truncated": truncated,
+                            "model": MODEL,
+                            "first_500_chars": answer[:500],
+                        }
+                    )

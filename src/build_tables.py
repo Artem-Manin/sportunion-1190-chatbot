@@ -27,13 +27,38 @@ Path("data").mkdir(parents=True, exist_ok=True)
 # -------------------------------------------------
 # Generic helpers
 # -------------------------------------------------
-def download_season_json(season: str, url: str, file_path: Path) -> Dict[str, Any] | None:
+def _load_local_json(file_path: Path) -> Dict[str, Any] | None:
+    """Load JSON from a local file if it exists, else return None."""
+    if not file_path.exists():
+        print(f"❌ Local file not found: {file_path}")
+        return None
+    print(f"➡ Using local file {file_path}")
+    with file_path.open("r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def download_season_json(
+    season: str,
+    url: str,
+    file_path: Path,
+    allow_download: bool,
+) -> Dict[str, Any] | None:
     """
-    1) Try to download JSON from URL and save to file_path.
-    2) If download fails, but file_path exists, load from local file.
-    3) If both fail, return None.
+    Behavior:
+    - If allow_download is False:
+        -> Only load from local file_path (no HTTP).
+    - If allow_download is True:
+        -> Try HTTP download, save to file_path.
+           On failure, fallback to local file_path if present.
+
+    Returns parsed JSON dict or None.
     """
     print(f"\n=== Season {season} ===")
+
+    if not allow_download:
+        print(f"Skipping download for season {season}, using local file only.")
+        return _load_local_json(file_path)
+
     print(f"Downloading from {url} ...")
     data = None
 
@@ -47,13 +72,8 @@ def download_season_json(season: str, url: str, file_path: Path) -> Dict[str, An
         print(f"✔ Downloaded and saved to {file_path}")
     except Exception as e:
         print(f"⚠ Download failed for season {season}: {e}")
-        if file_path.exists():
-            print(f"➡ Using existing local file {file_path}")
-            with file_path.open("r", encoding="utf-8") as fh:
-                data = json.load(fh)
-        else:
-            print(f"❌ No local fallback for season {season}")
-            return None
+        # fallback to existing local
+        data = _load_local_json(file_path)
 
     return data
 
@@ -74,7 +94,7 @@ def to_df(obj):
 
 
 # -------------------------------------------------
-# Players + stats builders (from your original code)
+# Players + stats builders
 # -------------------------------------------------
 def build_players_df(resp: Dict[str, Any]) -> pd.DataFrame:
     players = resp.get("players", [])
@@ -131,7 +151,6 @@ def build_stats_from_matchstatistics(resp: Dict[str, Any]) -> pd.DataFrame:
 
     ms["_pid"] = ms[player_col]
 
-    # aggregate without groupby.apply warning
     agg = (
         ms.groupby("_pid", as_index=False)
         .agg(
@@ -186,18 +205,17 @@ def build_matches_played_from_itemplayerhistory(resp: Dict[str, Any]) -> pd.Data
 
 
 # -------------------------------------------------
-# FIXED: matches_df builder WITHOUT groupby.apply warning
+# Matches builder
 # -------------------------------------------------
 def build_matches_df(resp: Dict[str, Any]) -> pd.DataFrame:
     """
-    Build a one-row-per-match table from matchScoreStatistics, avoiding
-    the deprecated groupby.apply(…) over grouping columns.
+    Build a one-row-per-match table from matchScoreStatistics,
+    using groupby().agg(...) instead of deprecated groupby.apply.
     """
     mss = to_df(resp.get("matchScoreStatistics", []))
     if mss.empty:
         return pd.DataFrame()
 
-    # ensure these columns exist
     needed_cols = [
         "soccerMatchId",
         "itemEventId",
@@ -213,7 +231,6 @@ def build_matches_df(resp: Dict[str, Any]) -> pd.DataFrame:
         if c not in mss.columns:
             mss[c] = pd.NA
 
-    # deterministic match_key
     def make_match_key(row):
         sm = row.get("soccerMatchId")
         try:
@@ -229,11 +246,9 @@ def build_matches_df(resp: Dict[str, Any]) -> pd.DataFrame:
 
     mss["match_key"] = mss.apply(make_match_key, axis=1)
 
-    # convert scores to numeric for agg
     mss["scoreTeamHome_num"] = pd.to_numeric(mss["scoreTeamHome"], errors="coerce")
     mss["scoreTeamAway_num"] = pd.to_numeric(mss["scoreTeamAway"], errors="coerce")
 
-    # FIX: use groupby().agg(...) instead of apply
     grouped = (
         mss.sort_values("itemEventDate")
         .groupby("match_key", as_index=False)
@@ -250,7 +265,6 @@ def build_matches_df(resp: Dict[str, Any]) -> pd.DataFrame:
         )
     )
 
-    # types
     grouped["soccer_match_id"] = pd.to_numeric(grouped["soccer_match_id"], errors="coerce").astype("Int64")
     grouped["home_score"] = grouped["home_score"].astype("Int64")
     grouped["away_score"] = grouped["away_score"].astype("Int64")
@@ -265,7 +279,6 @@ def build_player_stats(resp: Dict[str, Any]) -> pd.DataFrame:
 
     df = players_df[["player_id", "name", "exclude_from_statistics"]].copy()
 
-    # merge stats
     if not agg_stats.empty:
         df = df.merge(agg_stats, on="player_id", how="left")
     else:
@@ -278,7 +291,6 @@ def build_player_stats(resp: Dict[str, Any]) -> pd.DataFrame:
             df[c] = 0
     df[["goals", "assists", "own_goals"]] = df[["goals", "assists", "own_goals"]].fillna(0).astype(int)
 
-    # merge matches_played
     if not matches_played.empty:
         df = df.merge(matches_played, on="player_id", how="left")
     else:
@@ -292,12 +304,27 @@ def build_player_stats(resp: Dict[str, Any]) -> pd.DataFrame:
 # -------------------------------------------------
 # MAIN: process both seasons, add `season`, combine
 # -------------------------------------------------
-def main():
+def main(download_2526: bool = False):
+    """
+    Build combined tables for all seasons.
+
+    - Season 24/25 is ALWAYS loaded from local JSON (no HTTP).
+    - Season 25/26:
+        * If download_2526=True  -> try to download & update local file, fallback to local.
+        * If download_2526=False -> use local file only.
+    """
     all_player_stats = []
     all_matches = []
 
     for season, cfg in SEASONS.items():
-        data = download_season_json(season, cfg["url"], cfg["file"])
+        if season == "24/25":
+            allow_download = False
+        elif season == "25/26":
+            allow_download = download_2526
+        else:
+            allow_download = False
+
+        data = download_season_json(season, cfg["url"], cfg["file"], allow_download=allow_download)
         if data is None:
             continue
 
@@ -307,11 +334,9 @@ def main():
         player_stats = build_player_stats(resp)
         matches_df = build_matches_df(resp)
 
-        # attach season attribute
         player_stats["season"] = season
         matches_df["season"] = season
 
-        # print per-season top 10
         print("\nplayer_stats (top 10):")
         if not player_stats.empty:
             with pd.option_context("display.max_columns", None, "display.width", 200):
@@ -329,7 +354,6 @@ def main():
         all_player_stats.append(player_stats)
         all_matches.append(matches_df)
 
-    # combine both seasons
     if all_player_stats:
         player_stats_all = pd.concat(all_player_stats, ignore_index=True)
     else:
@@ -354,7 +378,6 @@ def main():
     else:
         print("<empty>")
 
-    # not saving final results, only return them for programmatic use
     return {
         "player_stats_all": player_stats_all,
         "matches_all": matches_all,
@@ -362,4 +385,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # If you run this file directly, you can choose whether to download 25/26
+    main(download_2526=True)
