@@ -1,3 +1,0 @@
-load files from url
-both seasons
-add to streamlit
