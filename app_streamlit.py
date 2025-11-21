@@ -1,243 +1,292 @@
-# app_streamlit_pure_llm.py
+# app_streamlit.py
+
 import os
+import sys
 import json
 from pathlib import Path
+
+import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-# attempt to import the OpenAI new client; app handles missing client gracefully
+# Allow importing build_tables.py from src/
+sys.path.append("src")
+
+try:
+    import build_tables
+except Exception as e:
+    st.error(f"Failed to import build_tables.py: {e}")
+    build_tables = None
+
+# Optional: OpenAI client
 try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
 
+
+# ================================
+# Unified Secrets: st.secrets (Cloud) OR .env (local)
+# ================================
 load_dotenv()
 
-# -----------------------
-# Config
-# -----------------------
-DATA_FILE_PATH = Path("data/season_2526.json")   # <- your uploaded file path
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
-MAX_CHARS_IN_PROMPT = int(os.getenv("MAX_CHARS_IN_PROMPT", "120000"))  # safety truncation (chars)
 
-# -----------------------
-# UI header
-# -----------------------
-st.set_page_config(page_title="Sport Union 1190 — Football Stat Chatbot", layout="wide")
-st.title("Sport Union 1190 — Football Stat Chatbot")
+def get_secret(key: str, default=None):
+    """
+    Unified secret getter:
+    - Try Streamlit secrets first (on Streamlit Cloud).
+    - If secrets are not configured or key is missing, fall back to env/.env.
+    """
+    # Try Streamlit secrets (but handle "no secrets" case gracefully)
+    try:
+        # This will raise StreamlitSecretNotFoundError if secrets.toml not set up
+        value = st.secrets[key]
+        if value is not None:
+            return value
+    except Exception:
+        pass  # no secrets configured or key not found
+
+    # Fallback: environment / .env
+    value = os.getenv(key, default)
+    return value if value is not None else default
+
+
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
+MODEL = get_secret("LLM_MODEL", "gpt-4o-mini")
+MAX_CHARS_IN_PROMPT = int(get_secret("MAX_CHARS_IN_PROMPT", "120000"))  # for safety
+
+
+# ================================
+# Streamlit UI Configuration
+# ================================
+st.set_page_config(page_title="Sport Union 1190 — Chatbot", layout="wide")
+st.title("⚽ Sport Union 1190 – Football Statistics Chatbot")
+
 st.markdown(
     """
-This app sends a **processed list of players** (small JSON) to the LLM and asks it to answer your question.
-We **do not** send the whole raw season file — only the flattened players table — to keep token usage low.
+This chatbot uses **two combined tables** built from season 24/25 and 25/26:
+
+- **player_stats** — per-player statistics + season  
+- **matches** — per-match scores + season  
+
+Your question + the filtered tables are sent to the LLM.
+Only the provided data may be used — no hallucinations.
 """
 )
 
-if not DATA_FILE_PATH.exists():
-    st.error(f"Data file not found at `{DATA_FILE_PATH}`. Put `season_2526.json` at that path or update the path.")
-else:
-    st.success(f"Loaded data file: `{DATA_FILE_PATH}`")
+st.info(f"Using model: `{MODEL}`")
 
 if OPENAI_API_KEY is None:
-    st.warning("OPENAI_API_KEY not set. LLM calls will fail until you add the key to environment or a .env file.")
+    st.warning("⚠️ OPENAI_API_KEY not found. Set it in Streamlit Secrets or in `.env` locally.")
 
-st.markdown(f"**Model:** `{MODEL}`  •  **Max prompt chars (safety):** {MAX_CHARS_IN_PROMPT}")
 
-# Always show input
-question = st.text_input("Ask a question (natural language). Examples: 'How many players do we have?', 'Who is excluded from statistics?'")
-ask_btn = st.button("Ask LLM (processed players JSON)")
+# ================================
+# Load / Build Tables (cached)
+# ================================
+@st.cache_data(show_spinner=True)
+def load_combined_tables():
+    """Call build_tables.main() → returns player_stats_all & matches_all."""
+    if build_tables is None:
+        return pd.DataFrame(), pd.DataFrame()
 
-# -----------------------
-# Helpers: load & flatten players
-# -----------------------
-def load_players_flat(path: Path):
-    """Return a Python list of flattened player dicts extracted from the season JSON."""
-    with open(path, "r", encoding="utf-8") as fh:
-        top = json.load(fh)
-    players_json = top.get("response", {}).get("players", [])
-    out = []
-    for p in players_json:
-        out.append({
-            "player_id": p.get("baseObjectId"),
-            "name": (p.get("name") or "").strip(),
-            "exclude_from_statistics": bool(p.get("excludeFromStatistics", False)),
-            "created_ts": p.get("createdTimestamp"),
-            "updated_ts": p.get("updatedTimestamp"),
-        })
-    return out
+    res = build_tables.main()
+    p = res.get("player_stats_all", pd.DataFrame())
+    m = res.get("matches_all", pd.DataFrame())
 
-# load once
-players_flat = []
-if DATA_FILE_PATH.exists():
-    try:
-        players_flat = load_players_flat(DATA_FILE_PATH)
-    except Exception as e:
-        st.error(f"Failed to load/flatten players JSON: {e}")
+    return p, m
 
-# prepare pretty JSON for LLM (string)
-players_json_for_prompt = json.dumps(players_flat, ensure_ascii=False, indent=2)
-st.markdown(f"Length: {len(players_json_for_prompt)}")
 
-# If it is too long for safety, it will be truncated later before sending
-if len(players_json_for_prompt) > MAX_CHARS_IN_PROMPT:
-    st.warning("Processed players JSON is large and will be truncated before sending to the model. "
-               "Consider reducing the number of fields or using intent-mode instead.")
+with st.spinner("Preparing data from both seasons..."):
+    player_stats_all, matches_all = load_combined_tables()
 
-# -----------------------
-# Robust extractor for different openai client shapes
-# -----------------------
+if player_stats_all.empty or matches_all.empty:
+    st.error("❌ Could not load tables from build_tables.py.")
+else:
+    st.success(
+        f"Loaded player_stats_all ({len(player_stats_all)} rows) and "
+        f"matches_all ({len(matches_all)} rows)."
+    )
+
+
+# ================================
+# Filters: Exclude flag & Seasons
+# ================================
+st.subheader("Filters")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    exclude_flag = st.checkbox(
+        "Exclude players who are marked as exclude_from_statistics",
+        value=True
+    )
+
+with col2:
+    seasons_available = sorted(player_stats_all["season"].dropna().unique())
+    seasons_selected = st.multiselect(
+        "Seasons to include:",
+        options=seasons_available,
+        default=seasons_available
+    )
+
+if not seasons_selected:
+    seasons_selected = seasons_available
+
+
+# Apply filters
+player_stats = player_stats_all[player_stats_all["season"].isin(seasons_selected)].copy()
+matches = matches_all[matches_all["season"].isin(seasons_selected)].copy()
+
+if exclude_flag:
+    player_stats = player_stats[player_stats["exclude_from_statistics"] == False]
+
+# ================================
+# Ask Question (Before Tables)
+# ================================
+st.markdown("---")
+st.subheader("Ask a question")
+
+question = st.text_input(
+    "Example: 'Who is the top scorer?', 'How many matches ended 4:3?', 'Show all players with >5 goals'"
+)
+btn = st.button("Ask the LLM")
+
+
+# ================================
+# Show Preview Tables
+# ================================
+st.markdown("---")
+st.subheader("Current Data (Preview)")
+
+colA, colB = st.columns(2)
+
+with colA:
+    st.markdown("**Player Stats (Top 15)**")
+    st.dataframe(player_stats.head(15))
+
+with colB:
+    st.markdown("**Matches (Top 15)**")
+    st.dataframe(matches.head(15))
+
+st.markdown(
+    f"- Rows in player_stats: **{len(player_stats)}**  \n"
+    f"- Rows in matches: **{len(matches)}**"
+)
+
+
+# ================================
+# LLM Helper: extract text safely
+# ================================
 def extract_assistant_text(resp):
-    """
-    Robust extraction of assistant text from OpenAI response objects.
-    Works with:
-      - resp.choices[0].message.content  (attribute style)
-      - resp.choices[0].message["content"] (dict style)
-      - resp.choices[0].text (legacy)
-      - fallback to str(resp)
-    """
+    """Handles all possible formats of OpenAI responses."""
     try:
         choice = resp.choices[0]
-    except Exception:
+    except:
         return str(resp)
 
-    # message attribute
     msg = getattr(choice, "message", None)
+
     if msg is not None:
-        # dict-like
         if isinstance(msg, dict):
-            if "content" in msg:
-                return msg["content"]
-        # object with attribute
+            return msg.get("content", str(msg))
         if hasattr(msg, "content"):
             return msg.content
-        # fallback: str(msg)
-        try:
-            return str(msg)
-        except Exception:
-            pass
 
-    # legacy text
     if hasattr(choice, "text"):
         return choice.text
 
-    # dict indexing fallback
     try:
         return choice["message"]["content"]
-    except Exception:
-        pass
+    except:
+        return str(resp)
 
-    return str(resp)
 
-# -----------------------
-# System instructions and examples
-# -----------------------
+# ================================
+# Build prompt & LLM call
+# ================================
 SYSTEM_INSTRUCTIONS = """
-You are a careful data analyst. I will provide a processed list of players as JSON (DATA_START ... DATA_END),
-followed by a user's question. You MUST answer using ONLY the provided data. Do NOT hallucinate values.
-If the requested information is not present in the data, respond exactly: "I don't see that information in the provided data."
-Be concise. When returning lists, you may use JSON arrays or short bullet lists.
+You are a careful football data analyst.
+You will receive two JSON tables: player_stats and matches.
+
+RULES:
+- Use ONLY the provided data.
+- Never invent players or matches.
+- If something is not answerable, say:
+  "I don't see that information in the provided data."
+- Be concise.
 """
 
 EXAMPLES = """
 Examples:
-
-Q: "How many players do we have?"
-A: "There are X players."  (only if X can be derived from the provided JSON)
-
-Q: "Who is excluded from statistics?"
-A: ["Name A", "Name B"]  (only if these names exist in the provided JSON)
+- "Who is the top scorer?"
+- "How many matches ended with 3:2?"
+- "List all players with >5 goals."
 """
 
-# -----------------------
-# LLM call (sends processed players JSON, truncated if needed)
-# -----------------------
-def call_llm_with_players(model, api_key, question, max_chars=MAX_CHARS_IN_PROMPT, max_tokens=800):
+
+def build_json_payload(ps: pd.DataFrame, ms: pd.DataFrame):
+    payload = {
+        "player_stats": ps.to_dict(orient="records"),
+        "matches": ms.to_dict(orient="records")
+    }
+    text = json.dumps(payload, ensure_ascii=False)
+
+    if len(text) > MAX_CHARS_IN_PROMPT:
+        return text[: MAX_CHARS_IN_PROMPT - 50] + '..."TRUNCATED"]}', True
+
+    return text, False
+
+
+def call_llm(question, ps, ms):
     if OpenAI is None:
-        raise RuntimeError("OpenAI python client not installed or import failed. Install `openai` package compatible with OpenAI SDK.")
-    client = OpenAI(api_key=api_key)
+        raise RuntimeError("OpenAI client not installed.")
 
-    # prepare JSON chunk (truncate for safety)
-    truncated = False
-    json_text = players_json_for_prompt
-    if len(json_text) > max_chars:
-        json_text = json_text[:max_chars]
-        truncated = True
+    client = OpenAI(api_key=OPENAI_API_KEY)
 
-    header = (
-        "Below is the processed list of players as JSON.\n"
-        "Use ONLY this data to answer. If truncated, you may respond 'DATA_TRUNCATED' if you cannot answer reliably.\n\n"
+    tables_json, truncated = build_json_payload(ps, ms)
+
+    user_content = (
+        "DATA_START\n"
+        + tables_json +
+        "\nDATA_END\n\n"
+        f"User question: {question}"
     )
 
-    user_content = header + "DATA_START\n" + json_text + "\nDATA_END\n\n" + f"User question: {question}\n"
-
-    # call the chat completions
     resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": SYSTEM_INSTRUCTIONS + "\n" + EXAMPLES},
-            {"role": "user", "content": user_content},
-        ],
+        model=MODEL,
         temperature=0.0,
-        max_tokens=max_tokens,
+        max_tokens=1200,
+        messages=[
+            {"role": "system", "content": SYSTEM_INSTRUCTIONS + EXAMPLES},
+            {"role": "user", "content": user_content}
+        ]
     )
 
-    text = extract_assistant_text(resp).strip()
-    return {"text": text, "truncated": truncated, "raw": resp}
+    return extract_assistant_text(resp), truncated, resp
 
-# -----------------------
-# Button action
-# -----------------------
-if ask_btn:
-    if not question or question.strip() == "":
-        st.warning("Please enter a question first.")
-    elif not DATA_FILE_PATH.exists():
-        st.error("Data file missing; cannot answer.")
-    elif OPENAI_API_KEY is None:
-        st.error("OPENAI_API_KEY not set. Set it in your environment or a .env file.")
+
+# ================================
+# Run LLM when button pressed
+# ================================
+if btn:
+    if not question.strip():
+        st.warning("Please enter a question.")
     else:
-        with st.spinner("Calling LLM..."):
+        with st.spinner("Contacting the LLM..."):
             try:
-                result = call_llm_with_players(MODEL, OPENAI_API_KEY, question)
+                answer, truncated, raw = call_llm(question, player_stats, matches)
             except Exception as e:
-                st.error(f"LLM call failed: {e}")
+                st.error(f"LLM ERROR: {e}")
             else:
-                if result.get("truncated"):
-                    st.warning("Note: processed players JSON was truncated before sending to the model. The model may reply 'DATA_TRUNCATED' if it cannot answer from partial data.")
-                st.subheader("LLM answer")
-                st.text(result["text"])
+                if truncated:
+                    st.warning("⚠️ Data was truncated before sending to model.")
 
-                with st.expander("Debug: raw LLM response"):
-                    try:
-                        # try to show sanitized raw resp
-                        raw = result.get("raw")
-                        # Avoid dumping huge internal objects; show top-level fields
-                        out = {}
-                        if raw is not None:
-                            out["model"] = getattr(raw, "model", None)
-                            out["choices_count"] = len(raw.choices) if hasattr(raw, "choices") else None
-                            out["truncated_sent"] = result.get("truncated", False)
-                            # extract assistant text too
-                            out["assistant_text_preview"] = result["text"][:1000]
-                        st.json(out)
-                    except Exception as e:
-                        st.write("Could not render raw response:", e)
+                st.subheader("LLM Answer")
+                st.write(answer)
 
-# -----------------------
-# Footer — show small sample of players and counts
-# -----------------------
-st.markdown("---")
-st.markdown("**Players (sample / stats)**")
-col1, col2 = st.columns([2,1])
-with col1:
-    if players_flat:
-        # show first 15 rows as table
-        sample = players_flat[:15]
-        st.table(sample)
-    else:
-        st.write("No players loaded.")
-with col2:
-    st.write(f"Total players loaded: **{len(players_flat)}**")
-    excl = [p["name"] for p in players_flat if p.get("exclude_from_statistics")]
-    st.write(f"Excluded from statistics: **{len(excl)}**")
-    if excl:
-        st.write(excl)
+                with st.expander("LLM Debug Info"):
+                    st.json({
+                        "input_truncated": truncated,
+                        "model": MODEL,
+                        "first_500_chars": answer[:500]
+                    })
