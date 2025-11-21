@@ -322,6 +322,7 @@ if submitted:
 # ================================
 with st.expander("💬 Sample questions", expanded=False):
     st.markdown(
+        "- How well did Uli play?\n"
         "- I am Karl. Who are my main competitors for goals and assists in the current season, "
         "both in total numbers and average per game?\n"
         "- Using only the available statistical data, divide the players into two balanced teams "
