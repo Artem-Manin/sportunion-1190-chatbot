@@ -48,7 +48,7 @@ def get_secret(key: str, default=None):
 
 
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
-MODEL = get_secret("LLM_MODEL", "gpt-4o-mini")
+MODEL = get_secret("LLM_MODEL", "gpt-4.1-mini")
 MAX_CHARS_IN_PROMPT = int(get_secret("MAX_CHARS_IN_PROMPT", "120000"))  # for safety
 
 
@@ -180,35 +180,18 @@ if (
 # ================================
 # Ask Question (Before Tables) — form so Enter submits
 # ================================
-st.subheader("Ask a question")
-
 with st.form("question_form"):
-    question = st.text_input(
-        "Example: 'Who is the top scorer?', 'How many matches ended 4:3?', 'Show all players with >5 goals'"
+    st.markdown(
+        "**Examples:**\n"
+        "- Who is the top scorer?\n"
+        "- Show all players with >5 goals\n"
+        "- I am Karl. Who are my main competitors for goals and assists in the current season, both in total numbers and average per game?\n"
+        "- Using only the available statistical data, divide the players into two balanced teams by distributing different performance profiles evenly between both sides."
     )
-    submitted = st.form_submit_button("Ask the LLM")
 
+    question = st.text_input("Ask your question")
 
-# ================================
-# Show Preview Tables
-# ================================
-st.markdown("---")
-st.subheader("Current Data (Preview)")
-
-colA, colB = st.columns(2)
-
-with colA:
-    st.markdown("**Player Stats (Top 15)**")
-    st.dataframe(player_stats.head(15))
-
-with colB:
-    st.markdown("**Matches (Top 15)**")
-    st.dataframe(matches.head(15))
-
-st.markdown(
-    f"- Rows in player_stats: **{len(player_stats)}**  \n"
-    f"- Rows in matches: **{len(matches)}**"
-)
+    submitted = st.form_submit_button("Ask your question")
 
 
 # ================================
@@ -247,19 +230,19 @@ You will receive two JSON tables: player_stats and matches.
 
 RULES:
 - Use ONLY the provided data for anything factual.
-- You ARE allowed to propose groupings or divisions of players into teams,
-  even if such teams do not exist in the raw data.
+- You ARE allowed to propose groupings or divisions of players into teams,  even if such teams do not exist in the raw data.
 - When creating teams, distribute players fairly based on available statistics.
 - If something is factually missing (goals, matches, etc.), say so.
 - Be concise.
-- Ignore the shortened surname, unless there are two persons with the same first name. E.g. Artem M. is Artem.
+- Ignore the shortened surname (e.g., “Artem M.”) and treat it as the full first name (Artem), unless there are multiple players with the same first name.
 """
 
 EXAMPLES = """
 Examples:
 - "Who is the top scorer?"
-- "How many matches ended with 3:2?"
-- "List all players with >5 goals."
+- "Show all players with >5 goals"
+- "I am Karl. Who are my main competitors for goals and assists in the current season, both in total numbers and average per game?"
+- "Using only the available statistical data, divide the players into two balanced teams by distributing different performance profiles evenly between both sides."
 """
 
 
@@ -311,7 +294,7 @@ if submitted:
     if not question.strip():
         st.warning("Please enter a question.")
     else:
-        with st.spinner("Contacting the LLM..."):
+        with st.spinner("Analyzing your question..."):
             try:
                 answer, truncated, raw = call_llm(question, player_stats, matches)
             except Exception as e:
@@ -320,7 +303,7 @@ if submitted:
                 if truncated:
                     st.warning("⚠️ Data was truncated before sending to model.")
 
-                st.subheader("LLM Answer")
+                st.subheader("Get answer")
                 st.write(answer)
 
                 with st.expander("LLM Debug Info"):
@@ -331,3 +314,17 @@ if submitted:
                             "first_500_chars": answer[:500],
                         }
                     )
+
+
+# ================================
+# Show Preview Tables
+# ================================
+with st.expander("🔍 Data Preview", expanded=False):
+
+    st.subheader("Player Stats (Top 5)")
+    st.dataframe(player_stats.head(5))
+    st.markdown(f"Rows in player_stats: **{len(player_stats)}**")
+
+    st.subheader("Matches (Top 5)")
+    st.dataframe(matches.head(5))
+    st.markdown(f"Rows in matches: **{len(matches)}**")
