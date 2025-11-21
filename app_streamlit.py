@@ -3,7 +3,6 @@
 import os
 import sys
 import json
-from pathlib import Path
 import inspect
 import pandas as pd
 import streamlit as st
@@ -57,25 +56,29 @@ MAX_CHARS_IN_PROMPT = int(get_secret("MAX_CHARS_IN_PROMPT", "120000"))  # for sa
 # Streamlit UI Configuration
 # ================================
 st.set_page_config(page_title="Sport Union 1190 — Chatbot", layout="wide")
-st.title("⚽ Sport Union 1190 – Football Statistics Chatbot")
 
 st.markdown(
     """
-This chatbot uses **two combined tables** built from season 24/25 and 25/26:
-
-- **player_stats** — per-player statistics + season  
-- **matches** — per-match scores + season  
-
-Your question + the filtered tables are sent to the LLM.
-Only the provided data may be used — no hallucinations.
-"""
+    <style>
+        .block-container {
+            padding-top: 1rem !important;
+        }
+        h1 {
+            margin-top: 0rem !important;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-st.info(f"Using model: `{MODEL}`")
+st.title("⚽ Sport Union 1190 – Football Statistics Chatbot")
+
+st.markdown("Explore player and match statistics from seasons 24/25 and 25/26.")
+
+#st.info(f"Using model: `{MODEL}`")
 
 if OPENAI_API_KEY is None:
     st.warning("⚠️ OPENAI_API_KEY not found. Set it in Streamlit Secrets or in `.env` locally.")
-
 
 # ================================
 # Cached loader for combined tables
@@ -83,81 +86,50 @@ if OPENAI_API_KEY is None:
 @st.cache_data(show_spinner=True)
 def load_combined_tables(download_2526: bool):
     """
-    Call build_tables.main() → returns player_stats_all & matches_all.
-
-    Works with both:
-    - main()                     (old version, no parameters)
-    - main(download_2526: bool)  (new version)
+    Load combined tables.
+    - download_2526=True → download & refresh 25/26
+    - download_2526=False → use local files only
     """
     if build_tables is None:
         return pd.DataFrame(), pd.DataFrame()
 
-    # Check if build_tables.main accepts a 'download_2526' parameter
-    try:
-        sig = inspect.signature(build_tables.main)
-        if "download_2526" in sig.parameters:
-            res = build_tables.main(download_2526=download_2526)
-        else:
-            # Old version: ignore the flag and just call main()
-            res = build_tables.main()
-    except TypeError:
-        # Extra safety: fallback to simple call
-        res = build_tables.main()
+    # call your updated build_tables main()
+    res = build_tables.main(download_2526=download_2526)
 
-    p = res.get("player_stats_all", pd.DataFrame())
-    m = res.get("matches_all", pd.DataFrame())
-    return p, m
+    player_stats_all = res.get("player_stats_all", pd.DataFrame())
+    matches_all = res.get("matches_all", pd.DataFrame())
 
+    return player_stats_all, matches_all
 
 # ================================
 # Data status + Refresh button
 # ================================
-st.markdown("---")
-st.subheader("Data status")
+with st.sidebar:
+    st.subheader("Data status")
 
-col_refresh, col_info = st.columns([1, 3])
+    refresh_clicked = st.button("🔄 Refresh 25/26 data")
 
-with col_refresh:
-    refresh_clicked = st.button("🔄 Refresh 25/26 data (download from API)")
+    st.caption("""
+    24/25 is always loaded locally.  
+    25/26 is refreshed from the API when you press the button.
+    """)
 
-with col_info:
-    st.caption(
-        "Season 24/25 is always loaded from a local JSON file. "
-        "Season 25/26 normally uses the local JSON too, but you can "
-        "refresh it from the API with this button (e.g. after Monday's match)."
-    )
+    # Clear cache so refresh loads immediately
+    if refresh_clicked:
+        try:
+            load_combined_tables.clear()
+        except Exception:
+            st.cache_data.clear()
 
-# If user clicked refresh, clear cache and call loader with download_2526=True
-download_2526_now = bool(refresh_clicked)
+    with st.spinner("Loading data..."):
+        player_stats_all, matches_all = load_combined_tables(download_2526=refresh_clicked)
 
-if refresh_clicked:
-    # Clear cached results so the new download is used immediately
-    try:
-        load_combined_tables.clear()
-    except Exception:
-        pass
-
-with st.spinner("Preparing data from both seasons..."):
-    player_stats_all, matches_all = load_combined_tables(download_2526=download_2526_now)
-
-if player_stats_all.empty or matches_all.empty:
-    st.error("❌ Could not load tables from build_tables.py.")
-else:
-    st.success(
-        f"Loaded player_stats_all ({len(player_stats_all)} rows) and "
-        f"matches_all ({len(matches_all)} rows)."
-    )
-
-    # Small field: show date of the last game
-    last_game_text = "unknown"
-    if "item_event_date" in matches_all.columns and not matches_all.empty:
-        dates = pd.to_datetime(matches_all["item_event_date"], errors="coerce", utc=True).dropna()
-        if not dates.empty:
-            last_ts = dates.max()
-            last_game_text = last_ts.strftime("%d.%m.%Y")
-
-    st.caption(f"📅 Last game in data: **{last_game_text}**")
-
+    if player_stats_all.empty or matches_all.empty:
+        st.error("❌ Could not load tables.")
+    else:
+        dates = pd.to_datetime(matches_all["item_event_date"], errors="coerce").dropna()
+        last_game = dates.max().strftime("%d.%m.%Y") if len(dates) else "unknown"
+        st.caption(f"📅 Last game: **{last_game}**")
 
 # ================================
 # Filters: Exclude flag & Seasons
@@ -208,7 +180,6 @@ if (
 # ================================
 # Ask Question (Before Tables) — form so Enter submits
 # ================================
-st.markdown("---")
 st.subheader("Ask a question")
 
 with st.form("question_form"):
@@ -275,11 +246,13 @@ You are a careful football data analyst.
 You will receive two JSON tables: player_stats and matches.
 
 RULES:
-- Use ONLY the provided data.
-- Never invent players or matches.
-- If something is not answerable, say:
-  "I don't see that information in the provided data."
+- Use ONLY the provided data for anything factual.
+- You ARE allowed to propose groupings or divisions of players into teams,
+  even if such teams do not exist in the raw data.
+- When creating teams, distribute players fairly based on available statistics.
+- If something is factually missing (goals, matches, etc.), say so.
 - Be concise.
+- Ignore the shortened surname, unless there are two persons with the same first name. E.g. Artem M. is Artem.
 """
 
 EXAMPLES = """

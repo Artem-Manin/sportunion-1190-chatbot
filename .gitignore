@@ -1,1 +1,45 @@
+# --- Python cache ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
 .env
+
+# --- Streamlit cache ---
+.streamlit/
+**/.streamlit/
+.streamlit/secrets.toml
+
+# --- Streamlit generated folders ---
+.streamlit/
+**/.streamlit/
+
+# --- Local data files (JSON from API) ---
+# data/*.json
+
+# If you want SOME JSON tracked, remove above line and list specific ones:
+# !data/season_2425.json
+
+# --- IDE files ---
+.vscode/
+.idea/
+
+# --- OS files ---
+.DS_Store
+Thumbs.db
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Logs ---
+logs/
+*.log
+
+# --- Temporary files ---
+*.tmp
+*.bak
