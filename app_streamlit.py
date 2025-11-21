@@ -3,7 +3,6 @@
 import os
 import sys
 import json
-import inspect
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
@@ -75,10 +74,9 @@ st.title("⚽ Sport Union 1190 – Football Statistics Chatbot")
 
 st.markdown("Explore player and match statistics from seasons 24/25 and 25/26.")
 
-#st.info(f"Using model: `{MODEL}`")
-
 if OPENAI_API_KEY is None:
     st.warning("⚠️ OPENAI_API_KEY not found. Set it in Streamlit Secrets or in `.env` locally.")
+
 
 # ================================
 # Cached loader for combined tables
@@ -101,18 +99,21 @@ def load_combined_tables(download_2526: bool):
 
     return player_stats_all, matches_all
 
+
 # ================================
-# Data status + Refresh button
+# Data status + Refresh button (sidebar)
 # ================================
 with st.sidebar:
     st.subheader("Data status")
 
     refresh_clicked = st.button("🔄 Refresh 25/26 data")
 
-    st.caption("""
-    24/25 is always loaded locally.  
-    25/26 is refreshed from the API when you press the button.
-    """)
+    st.caption(
+        """
+        Season 24/25 is always loaded locally.  
+        Season 25/26 is refreshed from the API when you press the button.
+        """
+    )
 
     # Clear cache so refresh loads immediately
     if refresh_clicked:
@@ -131,34 +132,37 @@ with st.sidebar:
         last_game = dates.max().strftime("%d.%m.%Y") if len(dates) else "unknown"
         st.caption(f"📅 Last game: **{last_game}**")
 
+
 # ================================
-# Filters: Exclude flag & Seasons
+# Filters: Exclude flag & Seasons (AFFECTS ANSWER)
 # ================================
-st.subheader("Filters")
+with st.expander("⚙️ Filters", expanded=False):
 
-col1, col2 = st.columns(2)
+    col1, col2 = st.columns(2)
 
-with col1:
-    exclude_flag = st.checkbox(
-        "Exclude players who are marked as exclude_from_statistics",
-        value=True,
-    )
+    with col1:
+        exclude_flag = st.checkbox(
+            "Exclude players who are marked as exclude_from_statistics",
+            value=True,
+        )
 
-with col2:
-    seasons_available = (
-        sorted(player_stats_all["season"].dropna().unique())
-        if not player_stats_all.empty
-        else []
-    )
-    seasons_selected = st.multiselect(
-        "Seasons to include:",
-        options=seasons_available,
-        default=seasons_available,
-    )
+    with col2:
+        seasons_available = (
+            sorted(player_stats_all["season"].dropna().unique())
+            if not player_stats_all.empty
+            else []
+        )
+        seasons_selected = st.multiselect(
+            "Seasons to include:",
+            options=seasons_available,
+            default=seasons_available,
+        )
 
-if not seasons_selected and seasons_available:
-    seasons_selected = seasons_available
+    # If user deselects all, fall back to "all"
+    if not seasons_selected and seasons_available:
+        seasons_selected = seasons_available
 
+# Build filtered tables based on filters
 if not player_stats_all.empty:
     player_stats = player_stats_all[player_stats_all["season"].isin(seasons_selected)].copy()
 else:
@@ -170,7 +174,8 @@ else:
     matches = pd.DataFrame()
 
 if (
-    exclude_flag
+    'exclude_flag' in locals()
+    and exclude_flag
     and not player_stats.empty
     and "exclude_from_statistics" in player_stats.columns
 ):
@@ -178,19 +183,13 @@ if (
 
 
 # ================================
-# Ask Question (Before Tables) — form so Enter submits
+# Ask Question — form so Enter submits
 # ================================
 with st.form("question_form"):
-    st.markdown(
-        "**Examples:**\n"
-        "- Who is the top scorer?\n"
-        "- Show all players with >5 goals\n"
-        "- I am Karl. Who are my main competitors for goals and assists in the current season, both in total numbers and average per game?\n"
-        "- Using only the available statistical data, divide the players into two balanced teams by distributing different performance profiles evenly between both sides."
+    question = st.text_input(
+        "Example: 'Who is the top scorer?', 'How many matches ended in a draw?', "
+        "'Show all players with >5 goals'"
     )
-
-    question = st.text_input("Ask your question")
-
     submitted = st.form_submit_button("Ask your question")
 
 
@@ -230,7 +229,7 @@ You will receive two JSON tables: player_stats and matches.
 
 RULES:
 - Use ONLY the provided data for anything factual.
-- You ARE allowed to propose groupings or divisions of players into teams,  even if such teams do not exist in the raw data.
+- You ARE allowed to propose groupings or divisions of players into teams, even if such teams do not exist in the raw data.
 - When creating teams, distribute players fairly based on available statistics.
 - If something is factually missing (goals, matches, etc.), say so.
 - Be concise.
@@ -240,9 +239,8 @@ RULES:
 EXAMPLES = """
 Examples:
 - "Who is the top scorer?"
-- "Show all players with >5 goals"
-- "I am Karl. Who are my main competitors for goals and assists in the current season, both in total numbers and average per game?"
-- "Using only the available statistical data, divide the players into two balanced teams by distributing different performance profiles evenly between both sides."
+- "How many matches ended in a draw?"
+- "List all players with >5 goals."
 """
 
 
@@ -254,6 +252,7 @@ def build_json_payload(ps: pd.DataFrame, ms: pd.DataFrame):
     text = json.dumps(payload, ensure_ascii=False)
 
     if len(text) > MAX_CHARS_IN_PROMPT:
+        # naive truncation to stay under limit
         return text[: MAX_CHARS_IN_PROMPT - 50] + '..."TRUNCATED"]}', True
 
     return text, False
@@ -294,32 +293,46 @@ if submitted:
     if not question.strip():
         st.warning("Please enter a question.")
     else:
-        with st.spinner("Analyzing your question..."):
+        if player_stats.empty or matches.empty:
+            st.warning("No data available for the selected filters.")
+        with st.spinner("Processing your question..."):
             try:
                 answer, truncated, raw = call_llm(question, player_stats, matches)
             except Exception as e:
-                st.error(f"LLM ERROR: {e}")
+                st.error(f"Error while contacting the model: {e}")
             else:
                 if truncated:
-                    st.warning("⚠️ Data was truncated before sending to model.")
+                    st.warning("⚠️ Data was truncated before sending to the model.")
 
-                st.subheader("Get answer")
+                st.subheader("Answer")
                 st.write(answer)
 
-                with st.expander("LLM Debug Info"):
-                    st.json(
-                        {
-                            "input_truncated": truncated,
-                            "model": MODEL,
-                            "first_500_chars": answer[:500],
-                        }
-                    )
+                # with st.expander("Debug info"):
+                #     st.json(
+                #         {
+                #             "input_truncated": truncated,
+                #             "model": MODEL,
+                #             "first_500_chars": answer[:500],
+                #         }
+                #     )
+
+
+# ================================
+# Sample questions
+# ================================
+with st.expander("💬 Sample questions", expanded=False):
+    st.markdown(
+        "- I am Karl. Who are my main competitors for goals and assists in the current season, "
+        "both in total numbers and average per game?\n"
+        "- Using only the available statistical data, divide the players into two balanced teams "
+        "by distributing different performance profiles evenly between both sides."
+    )
 
 
 # ================================
 # Show Preview Tables
 # ================================
-with st.expander("🔍 Data Preview", expanded=False):
+with st.expander("🔍 Data preview", expanded=False):
 
     st.subheader("Player Stats (Top 5)")
     st.dataframe(player_stats.head(5))
