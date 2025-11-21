@@ -4,7 +4,7 @@ import os
 import sys
 import json
 from pathlib import Path
-
+import inspect
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
@@ -85,13 +85,25 @@ def load_combined_tables(download_2526: bool):
     """
     Call build_tables.main() → returns player_stats_all & matches_all.
 
-    - download_2526=False: use local 25/26 JSON only (no HTTP).
-    - download_2526=True: download 25/26 from API, save JSON, fallback to local on error.
+    Works with both:
+    - main()                     (old version, no parameters)
+    - main(download_2526: bool)  (new version)
     """
     if build_tables is None:
         return pd.DataFrame(), pd.DataFrame()
 
-    res = build_tables.main(download_2526=download_2526)
+    # Check if build_tables.main accepts a 'download_2526' parameter
+    try:
+        sig = inspect.signature(build_tables.main)
+        if "download_2526" in sig.parameters:
+            res = build_tables.main(download_2526=download_2526)
+        else:
+            # Old version: ignore the flag and just call main()
+            res = build_tables.main()
+    except TypeError:
+        # Extra safety: fallback to simple call
+        res = build_tables.main()
+
     p = res.get("player_stats_all", pd.DataFrame())
     m = res.get("matches_all", pd.DataFrame())
     return p, m
