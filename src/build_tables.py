@@ -301,6 +301,149 @@ def build_player_stats(resp: Dict[str, Any]) -> pd.DataFrame:
     return df
 
 
+def build_scoring_events_df(resp: Dict[str, Any]) -> pd.DataFrame:
+    """
+    Build a one-row-per-goal events table from matchScoreStatistics.
+
+    Each row = one scoring event:
+    - scorer + (optional) assist + (optional) own-goal player
+    - match info (teams, date, current score)
+    - time of the goal (scoreTime)
+    """
+
+    mss = to_df(resp.get("matchScoreStatistics", []))
+    if mss.empty:
+        return pd.DataFrame(
+            columns=[
+                "match_key",
+                "soccer_match_id",
+                "item_event_id",
+                "item_event_date",
+                "score_time",
+                "team_home",
+                "team_away",
+                "team_home_id",
+                "team_away_id",
+                "score_team_id",
+                "score_team_home",
+                "score_team_away",
+                "scorer_id",
+                "scorer_name",
+                "assist_id",
+                "assist_name",
+                "own_goal_id",
+                "own_goal_name",
+            ]
+        )
+
+    # Normalise column names/types we need
+    mss["soccer_match_id"] = pd.to_numeric(mss.get("soccerMatchId"), errors="coerce").astype("Int64")
+    mss["item_event_id"] = pd.to_numeric(mss.get("itemEventId"), errors="coerce").astype("Int64")
+    mss["score_team_id"] = pd.to_numeric(mss.get("scoreTeamId"), errors="coerce").astype("Int64")
+    mss["team_home_id"] = pd.to_numeric(mss.get("teamHomeId"), errors="coerce").astype("Int64")
+    mss["team_away_id"] = pd.to_numeric(mss.get("teamAwayId"), errors="coerce").astype("Int64")
+
+    # These may be missing in some seasons, so be defensive
+    for col in ("scoreById", "assistById", "ownGoalById"):
+        if col not in mss.columns:
+            mss[col] = pd.NA
+        mss[col] = pd.to_numeric(mss[col], errors="coerce").astype("Int64")
+
+    # Keep a clean subset & rename
+    events = mss[
+        [
+            "itemEventDate",
+            "scoreTime",
+            "soccer_match_id",
+            "item_event_id",
+            "teamHome",
+            "teamAway",
+            "team_home_id",
+            "team_away_id",
+            "score_team_id",
+            "scoreTeamHome",
+            "scoreTeamAway",
+            "scoreById",
+            "assistById",
+            "ownGoalById",
+        ]
+    ].copy()
+
+    events = events.rename(
+        columns={
+            "itemEventDate": "item_event_date",
+            "scoreTime": "score_time",
+            "teamHome": "team_home",
+            "teamAway": "team_away",
+            "scoreTeamHome": "score_team_home",
+            "scoreTeamAway": "score_team_away",
+        }
+    )
+
+    # Build a match_key compatible with build_matches_df()
+    def make_match_key(row):
+        sm = row["soccer_match_id"]
+        try:
+            if pd.notna(sm) and int(sm) != 0:
+                return f"s{int(sm)}"
+        except Exception:
+            pass
+        ie = row["item_event_id"]
+        th = row["team_home_id"]
+        ta = row["team_away_id"]
+        date = row["item_event_date"]
+        return f"ie{ie}_h{th}_a{ta}_d{date}"
+
+    events["match_key"] = events.apply(make_match_key, axis=1)
+
+    # Attach player names (scorer / assist / own goal) using players list
+    players_df = build_players_df(resp)[["player_id", "name"]]
+
+    scorer = players_df.rename(columns={"player_id": "scorer_id", "name": "scorer_name"})
+    assist = players_df.rename(columns={"player_id": "assist_id", "name": "assist_name"})
+    own_g = players_df.rename(columns={"player_id": "own_goal_id", "name": "own_goal_name"})
+
+    events = events.merge(
+        scorer, left_on="scoreById", right_on="scorer_id", how="left"
+    ).merge(
+        assist, left_on="assistById", right_on="assist_id", how="left"
+    ).merge(
+        own_g, left_on="ownGoalById", right_on="own_goal_id", how="left"
+    )
+
+    # Optional: filter to "real goals" (i.e. something actually happened)
+    # Keep rows where there is a scorer or an own-goal player
+    mask_goal = events["scorer_id"].notna() | events["own_goal_id"].notna()
+    events = events[mask_goal].reset_index(drop=True)
+
+    # Final column order
+    cols_order = [
+        "match_key",
+        "soccer_match_id",
+        "item_event_id",
+        "item_event_date",
+        "score_time",
+        "team_home",
+        "team_away",
+        "team_home_id",
+        "team_away_id",
+        "score_team_id",
+        "score_team_home",
+        "score_team_away",
+        "scorer_id",
+        "scorer_name",
+        "assist_id",
+        "assist_name",
+        "own_goal_id",
+        "own_goal_name",
+    ]
+    # Some of these may be missing in weird edge cases, so intersect
+    cols_order = [c for c in cols_order if c in events.columns]
+    events = events[cols_order]
+
+    return events
+
+
 # -------------------------------------------------
 # MAIN: process both seasons, add `season`, combine
 # -------------------------------------------------
@@ -315,6 +458,7 @@ def main(download_2526: bool = False):
     """
     all_player_stats = []
     all_matches = []
+    all_events = []
 
     for season, cfg in SEASONS.items():
         if season == "24/25":
@@ -333,9 +477,11 @@ def main(download_2526: bool = False):
         print(f"\n--- Building tables for season {season} ---")
         player_stats = build_player_stats(resp)
         matches_df = build_matches_df(resp)
+        events_df = build_scoring_events_df(resp)
 
         player_stats["season"] = season
         matches_df["season"] = season
+        events_df["season"] = season
 
         print("\nplayer_stats (top 10):")
         if not player_stats.empty:
@@ -351,8 +497,16 @@ def main(download_2526: bool = False):
         else:
             print("<no matches>")
 
+        print("\nscoring_events_df (top 10):")
+        if not events_df.empty:
+            with pd.option_context("display.max_columns", None, "display.width", 200):
+                print(events_df.head(10).to_string(index=False))
+        else:
+            print("<no scoring events>")
+
         all_player_stats.append(player_stats)
         all_matches.append(matches_df)
+        all_events.append(events_df) 
 
     if all_player_stats:
         player_stats_all = pd.concat(all_player_stats, ignore_index=True)
@@ -364,6 +518,11 @@ def main(download_2526: bool = False):
     else:
         matches_all = pd.DataFrame()
 
+    if all_events:
+        events_all = pd.concat(all_events, ignore_index=True)
+    else:
+        events_all = pd.DataFrame()
+        
     print("\n=== COMBINED player_stats_all (top 10) ===")
     if not player_stats_all.empty:
         with pd.option_context("display.max_columns", None, "display.width", 200):
@@ -378,9 +537,17 @@ def main(download_2526: bool = False):
     else:
         print("<empty>")
 
+    print("\n=== COMBINED scoring_events_all (top 10) ===")
+    if not events_all.empty:
+        with pd.option_context("display.max_columns", None, "display.width", 200):
+            print(events_all.head(10).to_string(index=False))
+    else:
+        print("<empty>")
+
     return {
         "player_stats_all": player_stats_all,
         "matches_all": matches_all,
+        "events_all": events_all,
     }
 
 
