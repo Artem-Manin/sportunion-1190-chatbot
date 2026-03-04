@@ -4,4 +4,4 @@ pandas
 numpy
 tiktoken
 faiss-cpu
-streamlit
+streamlit>=1.32.0
